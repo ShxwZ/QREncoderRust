@@ -1,0 +1,19 @@
+[package]
+name = "encoder_qr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+decode_qrs_lib = { path = "../decode_qrs_lib" }
+qrcode = "0.14.1"
+image = "0.25.5"
+rayon = "1.10.0"
+base64 = "0.22.1"
+wgpu = "24.0.1"
+futures = "0.3.21"
+num_cpus = "1.16.0"
+bytemuck = { version = "1.14.0", features = ["derive"] }
+zstd = "0.13.3"
+tokio = { version = "1.28", features = ["full", "rt-multi-thread"] }
+async-channel = "2.3.1"
+crossbeam = "0.8.0"

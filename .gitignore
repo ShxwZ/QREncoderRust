@@ -1,0 +1,5 @@
+resources
+target
+/src
+/qrs/*
+/qrs/*.png

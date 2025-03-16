@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "decode_qrs_lib",
+    "encoder_qr",
+]
+
