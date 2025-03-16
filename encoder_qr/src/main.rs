@@ -8,7 +8,7 @@ use std::env::*;
 use std::sync::mpsc;
 use futures::executor::block_on;
 use zstd::stream::encode_all;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 // Custom imports
 mod image_utils;
 mod qr_utils;
@@ -19,7 +19,34 @@ use image_utils::*;
 use qr_utils::*;
 use frames_utils::*;
 
+struct AppConfig {
+    start_frame_index: usize,
+    max_frames: usize,
+    input_file: String,
+    output_dir: String,
+    shader_path: String,
+    fragment_size: usize,
+    frames_per_batch: usize,
+    chunks_per_frame: usize,
+    worker_threads: usize,
+}
+
 fn main() -> io::Result<()> {
+    // 1. Parsear argumentos y configurar la aplicación
+    let config = parse_arguments();
+    
+    // 2. Inicializar recursos
+    let (device, queue) = block_on(initialize_wgpu());
+    let shader_source = load_shader(&config.shader_path)?;
+    initialize_output_directory(&config.output_dir)?;
+    
+    // 3. Procesar el archivo
+    process_file(&config, &device, &queue, &shader_source)?;
+    
+    Ok(())
+}
+
+fn parse_arguments() -> AppConfig {
     // Obtener argumentos de línea de comandos
     let args: Vec<String> = Args::collect(self::args());
     let start_frame_index = if args.len() > 1 {
@@ -28,141 +55,279 @@ fn main() -> io::Result<()> {
         0
     };
     
-    // Configuración de rutas
-    let input_file = Path::new("C:\\Users\\Shaw\\Desktop\\QREncoderRust\\resources\\1gb.mp4");
-    let output_dir = Path::new("C:\\Users\\Shaw\\Desktop\\QREncoderRust\\qrs");
-    if !output_dir.exists() {
-        fs::create_dir_all(output_dir)?;
-    }
-    
-    // Cargar el shader una sola vez
-    let shader_source = fs::read_to_string("C:\\Users\\Shaw\\Desktop\\QREncoderRust\\encoder_qr\\src\\shader.wgsl")
-        .expect("No se pudo leer el archivo WGSL");
-    
-    // Inicializar GPU
-    let (device, queue) = block_on(initialize_wgpu());
-    
-    // Procesar el archivo por chunks para reducir uso de memoria
-    println!("[INFO] Iniciando procesamiento del archivo: {}", input_file.display());
-    
-    // Configuración de procesamiento
-    let fragment_size = 2800; 
-    let frames_per_batch = 60;
-    let chunks_per_frame = 6;
     let max_frames = if args.len() > 2 {
         args[2].parse::<usize>().unwrap_or(usize::MAX)
     } else {
         usize::MAX
     };
     
-    // Crear un runtime de Tokio optimizado
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)  // Ajusta según tu CPU
-        .enable_all()
-        .build()
-        .unwrap();
-    
-    runtime.block_on(async {
-        // Abrir archivo para streaming en lugar de cargarlo todo en memoria
-        let file = tokio::fs::File::open(input_file).await?;
-        let file_size = file.metadata().await?.len();
-        
-        println!("[INFO] Tamaño del archivo: {} bytes", file_size);
-        
-        // Calcular cuántos frames aproximados hay y procesar por lotes
-        let estimated_total_frames = (file_size as f64 / (fragment_size * chunks_per_frame) as f64) as usize;
-        println!("[INFO] Número estimado de frames: {}", estimated_total_frames);
-        
-        // Determinar cuántos frames procesar en esta ejecución
-        let end_frame_index = (start_frame_index + max_frames).min(estimated_total_frames);
-        println!("[INFO] Procesando frames {} a {}", start_frame_index, end_frame_index - 1);
-        
-        // Procesar el archivo en streaming
-        let mut reader = tokio::io::BufReader::new(file);
-        let mut buffer = vec![0u8; fragment_size * chunks_per_frame * frames_per_batch];
-        
-        // Saltar al punto de inicio si es necesario
-        if start_frame_index > 0 {
-            use tokio::io::AsyncSeekExt;
-            
-            let skip_bytes = start_frame_index * 6 * fragment_size;
-            reader.seek(std::io::SeekFrom::Start(skip_bytes as u64)).await?;
-            println!("[INFO] Saltados {} bytes para comenzar en el frame {}", skip_bytes, start_frame_index);
-        }
-        
-        // Procesar por lotes para eficiencia
-        let mut current_frame = start_frame_index;
-        let mut batch_index = 0;
-        
-        while current_frame < end_frame_index {
-            batch_index += 1;
-            
-            // Leer el siguiente lote de datos
-            let bytes_read = reader.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                println!("[INFO] Final del archivo alcanzado");
-                break;
-            }
-            
-            // Comprimir este lote en lugar de comprimir todo el archivo
-            let compressed_data = encode_all(&buffer[..bytes_read], 5).unwrap();
-            
-            // Dividir en chunks para los frames
-            let chunks: Vec<Vec<u8>> = compressed_data
-                .chunks(fragment_size)
-                .map(|chunk| chunk.to_vec())
-                .collect();
-                
-            let frames_count = chunks.len() / chunks_per_frame;
-            
-            println!("[BATCH {}] Procesando {} frames", batch_index, frames_count);
-            
-            // Generar QRs para este lote
-            let frame_chunks: Vec<Vec<Vec<u8>>> = chunks
-                .chunks(chunks_per_frame)
-                .map(|c| c.to_vec())
-                .collect();
-                
-            let qrs_for_batch: Vec<Vec<GrayImage>> = frame_chunks
-                .par_iter()
-                .map(|frame_chunks| {
-                    frame_chunks.iter()
-                        .filter_map(|chunk| generate_qrg_image_gray(chunk).ok())
-                        .collect()
-                })
-                .collect();
-                
-            // Procesar frames en GPU
-            process_frames_batch(
-                &device,
-                &queue,
-                &shader_source,
-                &qrs_for_batch,
-                &output_dir,
-                current_frame
-            ).await;
-            
-            // Actualizar conteo de frames
-            current_frame += frames_count;
-            
-            println!("[PROGRESO] Completados {}/{} frames", 
-                     (current_frame - start_frame_index), 
-                     (end_frame_index - start_frame_index));
-        }
-        
-        println!("\n[COMPLETADO] Procesamiento finalizado para los frames {} a {}.", 
-                start_frame_index, current_frame - 1);
-        
-        if current_frame < estimated_total_frames {
-            println!("\nPara continuar con el siguiente lote, ejecuta:");
-            println!("cargo run -- {}", current_frame);
-        }
-        
-        Ok(()) as io::Result<()>
-    })?;
-    
+    AppConfig {
+        start_frame_index,
+        max_frames,
+        input_file: "C:\\Users\\Shaw\\Desktop\\QREncoderRust\\resources\\1gb.mp4".to_string(),
+        output_dir: "C:\\Users\\Shaw\\Desktop\\QREncoderRust\\qrs".to_string(),
+        shader_path: "C:\\Users\\Shaw\\Desktop\\QREncoderRust\\encoder_qr\\src\\shader.wgsl".to_string(),
+        fragment_size: 2800,
+        frames_per_batch: 500,
+        chunks_per_frame: 6,
+        worker_threads: 4,
+    }
+}
+
+fn initialize_output_directory(output_dir: &str) -> io::Result<()> {
+    let path = Path::new(output_dir);
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
     Ok(())
 }
+
+fn load_shader(shader_path: &str) -> io::Result<String> {
+    fs::read_to_string(shader_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, 
+                 format!("No se pudo leer el archivo WGSL: {}", e)))
+}
+
+fn process_file(
+    config: &AppConfig, 
+    device: &wgpu::Device, 
+    queue: &wgpu::Queue,
+    shader_source: &str
+) -> io::Result<()> {
+    // Crear un runtime de Tokio optimizado
+    let runtime = build_tokio_runtime(config.worker_threads);
+    
+    runtime.block_on(async {
+        // 1. Abrir y analizar el archivo
+        let (_, estimated_total_frames, end_frame_index) = 
+            open_and_analyze_file(&config).await?;
+        
+        // 2. Preparar el lector y buffer
+        let (mut reader, mut buffer) = prepare_reader_and_buffer(&config).await?;
+        
+        // 3. Saltar al punto de inicio si es necesario
+        if config.start_frame_index > 0 {
+            skip_to_starting_position(&mut reader, config).await?;
+        }
+        
+        // 4. Procesar los frames por lotes
+        let current_frame = process_frames_in_batches(
+            &mut reader, 
+            &mut buffer,
+            device, 
+            queue, 
+            shader_source,
+            &config,
+            end_frame_index
+        ).await?;
+        
+        // 5. Mostrar resumen y opciones para continuar
+        display_summary(config.start_frame_index, current_frame, estimated_total_frames);
+        
+        Ok(()) as io::Result<()>
+    })
+}
+
+fn build_tokio_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+async fn open_and_analyze_file(config: &AppConfig) -> io::Result<(u64, usize, usize)> {
+    // Abrir archivo para streaming
+    let file = tokio::fs::File::open(&config.input_file).await?;
+    let file_size = file.metadata().await?.len();
+    
+    println!("[INFO] Tamaño del archivo: {} bytes", file_size);
+    
+    // Calcular cuántos frames aproximados hay
+    let estimated_total_frames = (file_size as f64 / 
+        (config.fragment_size * config.chunks_per_frame) as f64) as usize;
+    println!("[INFO] Número estimado de frames: {}", estimated_total_frames);
+    
+    // Determinar cuántos frames procesar en esta ejecución
+    let end_frame_index = (config.start_frame_index + config.max_frames)
+        .min(estimated_total_frames);
+    println!("[INFO] Procesando frames {} a {}", 
+             config.start_frame_index, end_frame_index - 1);
+             
+    Ok((file_size, estimated_total_frames, end_frame_index))
+}
+
+async fn prepare_reader_and_buffer(
+    config: &AppConfig
+) -> io::Result<(tokio::io::BufReader<tokio::fs::File>, Vec<u8>)> {
+    let file = tokio::fs::File::open(&config.input_file).await?;
+    let reader = tokio::io::BufReader::new(file);
+    
+    // Crear buffer para leer datos
+    let buffer_size = config.fragment_size * config.chunks_per_frame * config.frames_per_batch;
+    let buffer = vec![0u8; buffer_size];
+    
+    Ok((reader, buffer))
+}
+
+async fn skip_to_starting_position(
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+    config: &AppConfig
+) -> io::Result<()> {
+    let skip_bytes = config.start_frame_index * config.chunks_per_frame * config.fragment_size;
+    reader.seek(std::io::SeekFrom::Start(skip_bytes as u64)).await?;
+    
+    println!("[INFO] Saltados {} bytes para comenzar en el frame {}", 
+             skip_bytes, config.start_frame_index);
+             
+    Ok(())
+}
+
+async fn process_frames_in_batches(
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+    buffer: &mut Vec<u8>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shader_source: &str,
+    config: &AppConfig,
+    end_frame_index: usize
+) -> io::Result<usize> {
+    let mut current_frame = config.start_frame_index;
+    let mut batch_index = 0;
+    let output_dir = Path::new(&config.output_dir);
+    
+    while current_frame < end_frame_index {
+        batch_index += 1;
+        
+        // Procesar un lote
+        let frames_processed = process_single_batch(
+            reader, buffer, device, queue, shader_source,
+            config, output_dir, current_frame, batch_index
+        ).await?;
+        
+        if frames_processed == 0 {
+            println!("[INFO] Final del archivo alcanzado");
+            break;
+        }
+        
+        // Actualizar conteo de frames
+        current_frame += frames_processed;
+        
+        println!("[PROGRESO] Completados {}/{} frames", 
+                 (current_frame - config.start_frame_index), 
+                 (end_frame_index - config.start_frame_index));
+    }
+    
+    Ok(current_frame)
+}
+
+async fn process_single_batch(
+    reader: &mut tokio::io::BufReader<tokio::fs::File>,
+    buffer: &mut Vec<u8>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shader_source: &str,
+    config: &AppConfig,
+    output_dir: &Path,
+    current_frame: usize,
+    batch_index: usize
+) -> io::Result<usize> {
+    // 1. Leer datos con lectura completa del buffer
+    let start_read = std::time::Instant::now();
+    let mut bytes_read = 0;
+    let target_bytes = buffer.len();
+    
+    // Realizar múltiples lecturas hasta llenar el buffer o llegar al EOF
+    while bytes_read < target_bytes {
+        let read_result = reader.read(&mut buffer[bytes_read..]).await?;
+        if read_result == 0 {
+            // EOF alcanzado
+            break;
+        }
+        bytes_read += read_result;
+    }
+    
+    let read_time = start_read.elapsed();
+    
+    if bytes_read == 0 {
+        return Ok(0);
+    }
+    
+    // 2. Comprimir datos con nivel óptimo para velocidad/compresión
+    let start_compress = std::time::Instant::now();
+    let compression_level = 5;  // Más rápido que 5, pero todavía efectivo
+    let compressed_data = encode_all(&buffer[..bytes_read], compression_level).unwrap();
+    let compression_time = start_compress.elapsed();
+    
+    let compression_ratio = bytes_read as f64 / compressed_data.len() as f64;
+    println!("[DEBUG] Batch {}: Leídos {} bytes en {:.2?}, comprimidos a {} bytes ({:.2}x) en {:.2?}", 
+             batch_index, bytes_read, read_time, compressed_data.len(), 
+             compression_ratio, compression_time);
+    
+    // 3. Dividir en chunks para los frames
+    let chunks: Vec<Vec<u8>> = compressed_data
+        .chunks(config.fragment_size)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+        
+    let frames_count = chunks.len() / config.chunks_per_frame;
+    
+    println!("[BATCH {}] Procesando {} frames (de {} chunks)", 
+             batch_index, frames_count, chunks.len());
+    
+    // 4. Generar QRs
+    let start_qr = std::time::Instant::now();
+    let qrs_for_batch = generate_qr_codes(&chunks, config.chunks_per_frame);
+    let qr_time = start_qr.elapsed();
+    
+    println!("[DEBUG] Generación de QR para {} frames: {:.2?}", frames_count, qr_time);
+    
+    // 5. Procesar frames en GPU
+    process_frames_batch(
+        device,
+        queue,
+        shader_source,
+        &qrs_for_batch,
+        output_dir,
+        current_frame
+    ).await;
+    
+    Ok(frames_count)
+}
+
+fn generate_qr_codes(
+    chunks: &[Vec<u8>],
+    chunks_per_frame: usize
+) -> Vec<Vec<GrayImage>> {
+    // Agrupar chunks por frames
+    let frame_chunks: Vec<Vec<Vec<u8>>> = chunks
+        .chunks(chunks_per_frame)
+        .map(|c| c.to_vec())
+        .collect();
+        
+    // Generar QRs en paralelo
+    frame_chunks
+        .par_iter()
+        .map(|frame_chunks| {
+            frame_chunks.iter()
+                .filter_map(|chunk| generate_qrg_image_gray(chunk).ok())
+                .collect()
+        })
+        .collect()
+}
+
+fn display_summary(start_frame_index: usize, current_frame: usize, estimated_total_frames: usize) {
+    println!("\n[COMPLETADO] Procesamiento finalizado para los frames {} a {}.", 
+             start_frame_index, current_frame - 1);
+    
+    if current_frame < estimated_total_frames {
+        println!("\nPara continuar con el siguiente lote, ejecuta:");
+        println!("cargo run -- {}", current_frame);
+    } else {
+        println!("\n¡Procesamiento completo! Se procesaron todos los frames disponibles.");
+    }
+}
+
 
 async fn process_frames_batch(
     device: &wgpu::Device,
@@ -208,7 +373,7 @@ async fn process_frames_batch(
         let frame = read_frame_data(device,result_staging_buffer, frame_width, frame_height).await;
 
         tx.send((frame, absolute_batch_index, compute_time, transfer_time, frame_start_time))
-            .expect("Failed to send frame");
+           .expect("Failed to send frame");
     }
 
     drop(tx);

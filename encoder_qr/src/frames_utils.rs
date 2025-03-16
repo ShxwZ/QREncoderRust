@@ -5,39 +5,93 @@ use rayon::prelude::*;
 use std::sync::mpsc;
 use std::thread;
 use crate::image_utils::{encode_image, write_to_disk};
+use std::time::Duration;
+use std::sync::Arc;
 
 pub fn spawn_save_thread(
   rx: mpsc::Receiver<(image::ImageBuffer<Luma<u8>, Vec<u8>>, usize, std::time::Duration, std::time::Duration, std::time::Instant)>,
   output_dir: PathBuf,
 ) -> std::thread::JoinHandle<()> {
-  // Usar más hilos para I/O paralelo
-  let pool = rayon::ThreadPoolBuilder::new()
-      .num_threads(16)  // Más hilos para mejor paralelismo
+  // Aumentar el número de hilos para el procesamiento de frames
+  let pool = Arc::new(rayon::ThreadPoolBuilder::new()
+      .num_threads(32)  // Más hilos para mayor paralelismo
       .build()
-      .unwrap();
+      .unwrap());
   
-  thread::spawn(move || {
-      let mut pending_frames = Vec::with_capacity(16);
+  // Crear múltiples hilos de procesamiento en lugar de uno solo
+  const NUM_WORKER_THREADS: usize = 16; // Ajusta según la capacidad de tu sistema
+  
+  // Canal para distribuir el trabajo a los hilos
+  let (work_tx, work_rx) = mpsc::channel();
+  let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+  
+  // Crear hilos de procesamiento
+  let mut worker_handles = Vec::with_capacity(NUM_WORKER_THREADS);
+  for thread_id in 0..NUM_WORKER_THREADS {
+      let work_rx_clone = work_rx.clone();
+      let output_dir_clone = output_dir.clone();
+      let pool_clone = Arc::clone(&pool);  // Usar Arc::clone en lugar de .clone()
       
-      while let Ok((frame, index, compute_time, transfer_time, frame_start_time)) = rx.recv() {
-          // Acumular frames hasta un umbral
-          pending_frames.push((frame, index, compute_time, transfer_time, frame_start_time));
+      let handle = thread::spawn(move || {
+          let mut local_frames = Vec::with_capacity(16);
           
-          // Procesar en batch cuando tengamos suficientes o se acabe el stream
-          if pending_frames.len() >= 6 {
-              // Tomar propiedad de los frames pendientes y reemplazar con vector vacío
-              let frames_to_process = std::mem::replace(&mut pending_frames, Vec::with_capacity(16));
+          loop {
+              // Obtener trabajo del canal compartido
+              let frame = {
+                  let rx = work_rx_clone.lock().unwrap();
+                  match rx.try_recv() {
+                      Ok(frame) => Some(frame),
+                      Err(mpsc::TryRecvError::Empty) => None,
+                      Err(mpsc::TryRecvError::Disconnected) => break,
+                  }
+              };
               
-              // Usar el método común para procesar frames
-              process_pending_frames(frames_to_process, &output_dir, &pool);
+              if let Some(frame) = frame {
+                  local_frames.push(frame);
+              } else if !local_frames.is_empty() {
+                  // Procesar frames acumulados
+                  let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(16));
+                  process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
+              } else {
+                  // Esperar un poco si no hay trabajo
+                  thread::sleep(Duration::from_millis(1));
+              }
+          }
+          
+          // Procesar frames finales
+          if !local_frames.is_empty() {
+              let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(0));
+              process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
+          }
+          
+          println!("[WORKER {}] Finalizando", thread_id);
+      });
+      
+      worker_handles.push(handle);
+  }
+
+  // Hilo principal que recibe frames y los distribuye a los trabajadores
+  thread::spawn(move || {
+      // Recibir frames del canal principal y distribuirlos a los trabajadores
+      while let Ok(frame) = rx.recv() {
+          // Enviar el frame a un trabajador
+          if work_tx.send(frame).is_err() {
+              println!("[ERROR] Los trabajadores se han desconectado");
+              break;
           }
       }
       
-      // Procesar los frames restantes
-      if !pending_frames.is_empty() {
-          let frames_to_process = std::mem::replace(&mut pending_frames, Vec::with_capacity(16));
-          process_pending_frames(frames_to_process, &output_dir, &pool);
+      // Cuando el canal principal se cierra, también cerrar el canal de trabajo
+      drop(work_tx);
+      
+      // Esperar a que todos los trabajadores terminen
+      for (i, handle) in worker_handles.into_iter().enumerate() {
+          if let Err(e) = handle.join() {
+              println!("[ERROR] El hilo trabajador {} falló: {:?}", i, e);
+          }
       }
+      
+      println!("[SAVE THREAD] Todos los hilos de trabajadores han finalizado");
   })
 }
 
@@ -47,28 +101,42 @@ pub fn process_pending_frames(
   pool: &rayon::ThreadPool
 ) {
   pool.install(|| {
+      let start_process_time = std::time::Instant::now();
+      let total_frames = frames.len();
       frames.into_par_iter().for_each(|(frame, idx, compute_time, transfer_time, frame_start_time)| {
+          // Capturar el momento exacto cuando este frame comienza a procesarse en este hilo
+          let thread_start_time = std::time::Instant::now();
+          
           // Usar los métodos existentes para codificación y escritura
           let (buffer, encode_time) = encode_image(&frame);
-          
-          // Escribir a disco usando el método existente
           let write_time = write_to_disk(&output_dir, idx, &buffer);
           
-          // Reportar tiempos
+          // Tiempo total desde que se generó el frame hasta que se completó la escritura
           let real_total = frame_start_time.elapsed();
-          let actual_io_time = encode_time + write_time;
-          let overhead_time = real_total - compute_time - transfer_time - actual_io_time;
           
-          println!("Frame {} saved: Total={:.2?}, GPU={:.2?} (Compute={:.2?}, Transfer={:.2?}), I/O={:.2?} (Encode={:.2?}, Write={:.2?}), Queue/Overhead={:.2?}", 
-              idx, real_total, 
-              compute_time.saturating_add(transfer_time),
-              compute_time, transfer_time, 
-              actual_io_time, encode_time, write_time,
-              overhead_time);
+          // Tiempo de procesamiento en este hilo específicamente
+          let thread_time = thread_start_time.elapsed();
+          
+          // Tiempo que pasó en colas antes de comenzar a procesarse en este hilo
+          let queue_time = real_total - compute_time - transfer_time - thread_time;
+          
+          // Overhead dentro del procesamiento en este hilo (si hay alguno)
+          let actual_io_time = encode_time + write_time;
+          let thread_overhead = thread_time - actual_io_time;
+          
+          println!("Frame {} saved: Total={:.2?}, En cola={:.2?}, En hilo={:.2?} (I/O={:.2?}, Overhead={:.2?})",
+                  idx, real_total, queue_time, thread_time, actual_io_time, thread_overhead);
+          
+          // Versión detallada para depuración
+          println!("  Desglose: GPU={:.2?} (Compute={:.2?}, Transfer={:.2?}), I/O={:.2?} (Encode={:.2?}, Write={:.2?})", 
+                  compute_time + transfer_time, compute_time, transfer_time, 
+                  actual_io_time, encode_time, write_time);
       });
+      
+      println!("Batch procesado en {:.2?} ({} frames)", 
+              start_process_time.elapsed(), total_frames);
   });
 }
-
 pub async fn read_frame_data(
   device: &wgpu::Device,
   result_staging_buffer: wgpu::Buffer,

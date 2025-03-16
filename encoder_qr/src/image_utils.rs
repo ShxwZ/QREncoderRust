@@ -3,7 +3,7 @@ use std::time::Duration;
 use image::{GrayImage, ImageEncoder};
 
 pub fn encode_image(frame: &GrayImage) ->( Vec<u8>, Duration) {
-  let capacity = frame.width() as usize * frame.height() as usize * 2; // Estimación conservadora
+  let capacity = frame.width() as usize * frame.height() as usize * 2; // Estimación
   let mut buffer = Vec::with_capacity(capacity);
   let start_time = std::time::Instant::now();
   // Usar configuraciones de máximo rendimiento para PNG

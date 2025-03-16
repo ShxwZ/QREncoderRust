@@ -1,5 +1,5 @@
-resources
-target
+/resources
+/target/
 /src
-/qrs/*
+/qrs
 /qrs/*.png
