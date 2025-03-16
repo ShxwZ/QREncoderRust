@@ -5,7 +5,6 @@ use rayon::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task;
 use crate::image_utils::{encode_image, write_to_disk};
-use std::time::Duration;
 use std::sync::Arc;
 
 pub fn spawn_save_thread(
@@ -14,58 +13,53 @@ pub fn spawn_save_thread(
 ) -> task::JoinHandle<()> {
   // Aumentar el número de hilos para el procesamiento de frames
   let pool = Arc::new(rayon::ThreadPoolBuilder::new()
-      .num_threads(128)  // Aumentar el número de hilos para mayor paralelismo
+      .num_threads(128)
       .build()
       .unwrap());
   
-  // Crear múltiples hilos de procesamiento en lugar de uno solo
-  const NUM_WORKER_THREADS: usize = 64; // Ajusta según la capacidad de tu sistema
+  // Crear múltiples hilos de procesamiento
+  const NUM_WORKER_THREADS: usize = 64;
   
-  // Canal para distribuir el trabajo a los hilos
-  let (work_tx, work_rx) = mpsc::channel(500); // Aumentar el tamaño del buffer del canal
-  let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+  // En lugar de un Mutex, usamos canales de un solo productor, múltiples consumidores
+  let mut receivers = Vec::with_capacity(NUM_WORKER_THREADS);
+  let mut senders = Vec::with_capacity(NUM_WORKER_THREADS);
+  
+  for _ in 0..NUM_WORKER_THREADS {
+      let (tx, rx) = tokio::sync::mpsc::channel(10);
+      senders.push(tx);
+      receivers.push(rx);
+  }
   
   // Crear hilos de procesamiento
   let mut worker_handles = Vec::with_capacity(NUM_WORKER_THREADS);
-  for thread_id in 0..NUM_WORKER_THREADS {
-      let work_rx_clone = work_rx.clone();
+  for (thread_id, mut receiver) in receivers.into_iter().enumerate() {
       let output_dir_clone = output_dir.clone();
-      let pool_clone = Arc::clone(&pool);  // Usar Arc::clone en lugar de .clone()
+      let pool_clone = Arc::clone(&pool);
       
       let handle = std::thread::spawn(move || {
           let mut local_frames = Vec::with_capacity(16);
-          let mut wait_time = Duration::from_millis(1);
+          let runtime = tokio::runtime::Builder::new_current_thread()
+              .enable_all()
+              .build()
+              .unwrap();
           
-          loop {
-              // Obtener trabajo del canal compartido
-              let frame = {
-                  let mut rx = work_rx_clone.lock().unwrap();
-                  match rx.try_recv() {
-                      Ok(frame) => Some(frame),
-                      Err(mpsc::error::TryRecvError::Empty) => None,
-                      Err(mpsc::error::TryRecvError::Disconnected) => break,
-                  }
-              };
-              
-              if let Some(frame) = frame {
+          runtime.block_on(async {
+              while let Some(frame) = receiver.recv().await {
                   local_frames.push(frame);
-                  wait_time = Duration::from_millis(1); // Resetear tiempo de espera
-              } else if !local_frames.is_empty() {
-                  // Procesar frames acumulados
-                  let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(16));
-                  process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
-              } else {
-                  // Esperar un poco si no hay trabajo, con espera exponencial
-                  std::thread::sleep(wait_time);
-                  wait_time = (wait_time * 2).min(Duration::from_millis(100));
+                  
+                  // Procesar inmediatamente si hay suficientes frames acumulados
+                  if local_frames.len() >= 4 {
+                      let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(16));
+                      process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
+                  }
               }
-          }
-          
-          // Procesar frames finales
-          if !local_frames.is_empty() {
-              let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(0));
-              process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
-          }
+              
+              // Procesar frames finales
+              if !local_frames.is_empty() {
+                  let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(0));
+                  process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
+              }
+          });
           
           println!("[WORKER {}] Finalizando", thread_id);
       });
@@ -73,19 +67,25 @@ pub fn spawn_save_thread(
       worker_handles.push(handle);
   }
 
-  // Hilo principal que recibe frames y los distribuye a los trabajadores
+  // Hilo principal que distribuye frames de manera equitativa
   task::spawn(async move {
+      let mut frame_counter = 0;
+      let num_workers = senders.len();
+      
       // Recibir frames del canal principal y distribuirlos a los trabajadores
       while let Some(frame) = rx.recv().await {
-          // Enviar el frame a un trabajador
-          if work_tx.send(frame).await.is_err() {
-              println!("[ERROR] Los trabajadores se han desconectado");
-              break;
+          // Distribuir de forma circular usando contador
+          let worker_index = frame_counter % num_workers;
+          frame_counter += 1;
+          
+          // Enviar directamente al trabajador correspondiente
+          if senders[worker_index].send(frame).await.is_err() {
+              println!("[ERROR] Trabajador {} desconectado", worker_index);
           }
       }
       
-      // Cuando el canal principal se cierra, también cerrar el canal de trabajo
-      drop(work_tx);
+      // Cerrar todos los canales de trabajo
+      senders.clear();
       
       // Esperar a que todos los trabajadores terminen
       for (i, handle) in worker_handles.into_iter().enumerate() {
@@ -147,28 +147,37 @@ pub async fn read_frame_data(
   frame_width: u32,
   frame_height: u32,
 ) -> GrayImage {
-  // Mapear buffer y esperar resultados
+  // Reducir la contención de la GPU iniciando la operación de mapeo lo antes posible
   let buffer_slice = result_staging_buffer.slice(..);
-  let scale_factor = 2;  // Debe coincidir con el valor en create_buffers y run_compute_shader
+  let scale_factor = 2;
   let scaled_width = frame_width / scale_factor;
   let scaled_height = frame_height / scale_factor;
-  let (sender, receiver) = futures::channel::oneshot::channel();
   
+  // Iniciar el mapeo inmediatamente
+  let (sender, receiver) = futures::channel::oneshot::channel();
   buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-      sender.send(result).unwrap();
+      // Manejar posibles errores al enviar el resultado
+      if let Err(_) = sender.send(result) {
+          println!("Error: El receptor fue descartado antes de recibir el resultado");
+      }
   });
   
-  // Esto es un punto de sincronización crítico - espera a que la GPU termine
+  // Método más simple y confiable: esperar de forma asíncrona a que la GPU termine
   device.poll(wgpu::Maintain::Wait);
-  let _ = receiver.await.ok().expect("Failed to map buffer");
-
+  
+  // Esperar el resultado de forma asíncrona
+  _ = receiver.await
+      .expect("El canal fue cerrado prematuramente")
+      .expect("Error al mapear el buffer");
+      
+  // El buffer ahora está garantizado que está mapeado
   let data = buffer_slice.get_mapped_range();
   let frame_data_u32: &[u32] = bytemuck::cast_slice(&*data);
   let frame_data_u8: Vec<u8> = frame_data_u32.iter()
       .map(|&rgba| ((rgba >> 16) & 0xFF) as u8)
       .collect();
   
-  // Crear imagen
-  return GrayImage::from_raw(scaled_width, scaled_height, frame_data_u8)
-   .expect("No se pudo crear la imagen desde los datos de la GPU");
+  // Crear la imagen a partir de los datos extraídos
+  GrayImage::from_raw(scaled_width, scaled_height, frame_data_u8)
+    .expect("No se pudo crear la imagen desde los datos de la GPU")
 }

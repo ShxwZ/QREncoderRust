@@ -223,8 +223,8 @@ pub fn run_compute_shader(
 }
 
 pub fn create_buffers(
-    device: &wgpu::Device,
-    qr_data: &[u32],
+    device: &std::sync::Arc<wgpu::Device>,
+    qr_data: &Vec<u32>,
     frame_width: u32,
     frame_height: u32,
     qrs_count: u32,
