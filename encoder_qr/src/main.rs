@@ -5,7 +5,7 @@ use image::GrayImage;
 use image::Luma;
 use rayon::prelude::*;
 use std::env::*;
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 use futures::executor::block_on;
 use zstd::stream::encode_all;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -328,7 +328,6 @@ fn display_summary(start_frame_index: usize, current_frame: usize, estimated_tot
     }
 }
 
-
 async fn process_frames_batch(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -339,7 +338,7 @@ async fn process_frames_batch(
 ) {
     create_output_directory(output_dir);
 
-    let (tx, rx) = create_channel();
+    let (tx, rx) = create_channel().await;
     let save_thread = spawn_save_thread(rx, output_dir.to_path_buf());
 
     if frames_qrs.is_empty() {
@@ -365,7 +364,6 @@ async fn process_frames_batch(
 
         let (bind_group, compute_pipeline) = create_bind_group_and_pipe_layout(device, &qr_buffer, &frame_buffer, &uniform_buffer, shader_source,&absolute_batch_index);
 
-
         let (compute_time, transfer_time,result_staging_buffer) = run_compute_shader(
             device, queue, &bind_group, &compute_pipeline, &frame_buffer, frame_width, frame_height, &absolute_batch_index
         );
@@ -373,25 +371,17 @@ async fn process_frames_batch(
         let frame = read_frame_data(device,result_staging_buffer, frame_width, frame_height).await;
 
         tx.send((frame, absolute_batch_index, compute_time, transfer_time, frame_start_time))
+           .await
            .expect("Failed to send frame");
     }
 
     drop(tx);
-    save_thread.join().expect("Failed to join save thread");
+    save_thread.await.expect("Failed to join save thread");
 }
 
-
-
-fn create_channel() -> (
+async fn create_channel() -> (
     mpsc::Sender<(image::ImageBuffer<Luma<u8>, Vec<u8>>, usize, std::time::Duration, std::time::Duration, std::time::Instant)>, 
     mpsc::Receiver<(image::ImageBuffer<Luma<u8>, Vec<u8>>, usize, std::time::Duration, std::time::Duration, std::time::Instant)>
 ) {
-    return  mpsc::channel::<(
-        image::ImageBuffer<image::Luma<u8>, Vec<u8>>, // GrayImage
-        usize,                                        // índice del frame
-        std::time::Duration,                          // tiempo de cómputo
-        std::time::Duration,                          // tiempo de transferencia
-        std::time::Instant                            // tiempo de inicio del frame
-    )>();
+    mpsc::channel(500) // Aumentar el tamaño del buffer del canal
 }
-

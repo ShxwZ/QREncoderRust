@@ -2,27 +2,27 @@ use std::path::PathBuf;
 use image::GrayImage;
 use image::Luma;
 use rayon::prelude::*;
-use std::sync::mpsc;
-use std::thread;
+use tokio::sync::mpsc;
+use tokio::task;
 use crate::image_utils::{encode_image, write_to_disk};
 use std::time::Duration;
 use std::sync::Arc;
 
 pub fn spawn_save_thread(
-  rx: mpsc::Receiver<(image::ImageBuffer<Luma<u8>, Vec<u8>>, usize, std::time::Duration, std::time::Duration, std::time::Instant)>,
+  mut rx: mpsc::Receiver<(image::ImageBuffer<Luma<u8>, Vec<u8>>, usize, std::time::Duration, std::time::Duration, std::time::Instant)>,
   output_dir: PathBuf,
-) -> std::thread::JoinHandle<()> {
+) -> task::JoinHandle<()> {
   // Aumentar el número de hilos para el procesamiento de frames
   let pool = Arc::new(rayon::ThreadPoolBuilder::new()
-      .num_threads(32)  // Más hilos para mayor paralelismo
+      .num_threads(128)  // Aumentar el número de hilos para mayor paralelismo
       .build()
       .unwrap());
   
   // Crear múltiples hilos de procesamiento en lugar de uno solo
-  const NUM_WORKER_THREADS: usize = 16; // Ajusta según la capacidad de tu sistema
+  const NUM_WORKER_THREADS: usize = 64; // Ajusta según la capacidad de tu sistema
   
   // Canal para distribuir el trabajo a los hilos
-  let (work_tx, work_rx) = mpsc::channel();
+  let (work_tx, work_rx) = mpsc::channel(500); // Aumentar el tamaño del buffer del canal
   let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
   
   // Crear hilos de procesamiento
@@ -32,29 +32,32 @@ pub fn spawn_save_thread(
       let output_dir_clone = output_dir.clone();
       let pool_clone = Arc::clone(&pool);  // Usar Arc::clone en lugar de .clone()
       
-      let handle = thread::spawn(move || {
+      let handle = std::thread::spawn(move || {
           let mut local_frames = Vec::with_capacity(16);
+          let mut wait_time = Duration::from_millis(1);
           
           loop {
               // Obtener trabajo del canal compartido
               let frame = {
-                  let rx = work_rx_clone.lock().unwrap();
+                  let mut rx = work_rx_clone.lock().unwrap();
                   match rx.try_recv() {
                       Ok(frame) => Some(frame),
-                      Err(mpsc::TryRecvError::Empty) => None,
-                      Err(mpsc::TryRecvError::Disconnected) => break,
+                      Err(mpsc::error::TryRecvError::Empty) => None,
+                      Err(mpsc::error::TryRecvError::Disconnected) => break,
                   }
               };
               
               if let Some(frame) = frame {
                   local_frames.push(frame);
+                  wait_time = Duration::from_millis(1); // Resetear tiempo de espera
               } else if !local_frames.is_empty() {
                   // Procesar frames acumulados
                   let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(16));
                   process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
               } else {
-                  // Esperar un poco si no hay trabajo
-                  thread::sleep(Duration::from_millis(1));
+                  // Esperar un poco si no hay trabajo, con espera exponencial
+                  std::thread::sleep(wait_time);
+                  wait_time = (wait_time * 2).min(Duration::from_millis(100));
               }
           }
           
@@ -71,11 +74,11 @@ pub fn spawn_save_thread(
   }
 
   // Hilo principal que recibe frames y los distribuye a los trabajadores
-  thread::spawn(move || {
+  task::spawn(async move {
       // Recibir frames del canal principal y distribuirlos a los trabajadores
-      while let Ok(frame) = rx.recv() {
+      while let Some(frame) = rx.recv().await {
           // Enviar el frame a un trabajador
-          if work_tx.send(frame).is_err() {
+          if work_tx.send(frame).await.is_err() {
               println!("[ERROR] Los trabajadores se han desconectado");
               break;
           }
@@ -137,6 +140,7 @@ pub fn process_pending_frames(
               start_process_time.elapsed(), total_frames);
   });
 }
+
 pub async fn read_frame_data(
   device: &wgpu::Device,
   result_staging_buffer: wgpu::Buffer,
@@ -167,7 +171,4 @@ pub async fn read_frame_data(
   // Crear imagen
   return GrayImage::from_raw(scaled_width, scaled_height, frame_data_u8)
    .expect("No se pudo crear la imagen desde los datos de la GPU");
-
-
 }
-
