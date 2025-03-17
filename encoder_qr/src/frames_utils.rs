@@ -18,7 +18,7 @@ pub fn spawn_save_thread(
       .unwrap());
   
   // Crear múltiples hilos de procesamiento
-  const NUM_WORKER_THREADS: usize = 64;
+  const NUM_WORKER_THREADS: usize = 3;
   
   // En lugar de un Mutex, usamos canales de un solo productor, múltiples consumidores
   let mut receivers = Vec::with_capacity(NUM_WORKER_THREADS);
@@ -48,7 +48,7 @@ pub fn spawn_save_thread(
                   local_frames.push(frame);
                   
                   // Procesar inmediatamente si hay suficientes frames acumulados
-                  if local_frames.len() >= 4 {
+                  if local_frames.len() >= 2 {
                       let frames_to_process = std::mem::replace(&mut local_frames, Vec::with_capacity(16));
                       process_pending_frames(frames_to_process, &output_dir_clone, &pool_clone);
                   }

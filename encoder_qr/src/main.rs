@@ -71,7 +71,7 @@ fn parse_arguments() -> AppConfig {
         output_dir: "C:\\Users\\Shaw\\Desktop\\QREncoderRust\\qrs".to_string(),
         shader_path: "C:\\Users\\Shaw\\Desktop\\QREncoderRust\\encoder_qr\\src\\shader.wgsl".to_string(),
         fragment_size: 2800,
-        frames_per_batch: 500,
+        frames_per_batch: 120,
         chunks_per_frame: 6,
         worker_threads: 6,
     }
@@ -358,7 +358,7 @@ async fn process_frames_batch(
     let (frame_width, frame_height) = get_frame_dimensions(frames_qrs);
 
     // Procesar frames en paralelo, limitando a un máximo razonable para no sobrecargar la GPU
-    let max_parallel_frames = 4; // Ajusta según tu GPU
+    let max_parallel_frames = 6; // Ajusta según tu GPU
     let mut futures = Vec::new();
 
     for (batch_index, qrs) in frames_qrs.iter().enumerate() {
